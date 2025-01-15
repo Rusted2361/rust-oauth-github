@@ -3,12 +3,20 @@ use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{sync,env};
-use std::sync::{Arc, Mutex};
 use tokio;
 
 #[derive(Deserialize, Serialize)]
 struct OAuthCallback {
     code: String,
+}
+
+// Shared application state
+#[derive(Clone)]
+struct AppState {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    access_token: std::sync::Arc<tokio::sync::Mutex<String>>,
 }
 
 #[tokio::main]
@@ -31,15 +39,6 @@ async fn main() -> std::io::Result<()> {
     .bind("127.0.0.1:3000")?
     .run()
     .await
-}
-
-// Shared application state
-#[derive(Clone)]
-struct AppState {
-    client_id: String,
-    client_secret: String,
-    redirect_uri: String,
-    access_token: std::sync::Arc<tokio::sync::Mutex<String>>,
 }
 
 async fn login_oauth(
@@ -94,7 +93,7 @@ async fn oauth_callback(
 async fn fetch_repo_tree(
     path: web::Path<(String, String)>,
     query: web::Query<Value>,
-    access_token: web::Data<Arc<Mutex<String>>>,
+    data: web::Data<AppState>
 ) -> impl Responder {
     let (owner, repo) = path.into_inner();
     let branch = query.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
@@ -104,19 +103,34 @@ async fn fetch_repo_tree(
     );
 
     let client = reqwest::Client::new();
-    let token = access_token.lock().unwrap().clone();
+    let token = data.access_token.lock().await;
+
+    // Log the API URL
+    dbg!(&api_url);
 
     match client
         .get(&api_url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "application/vnd.github.v3+json")
+        .header("User-Agent", "oauthapp-rust")
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(json) => HttpResponse::Ok().json(json),
-            Err(_) => HttpResponse::InternalServerError().json("Failed to parse JSON response"),
+        Ok(resp) => {
+            // Log the raw response body
+            let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+
+            match serde_json::from_str::<Value>(&body) {
+                Ok(json) => HttpResponse::Ok().json(json),
+                Err(_e) => {
+                    // Log the JSON parsing error
+                    HttpResponse::InternalServerError().json("Failed to parse JSON response")
+                }
+            }
         },
-        Err(_) => HttpResponse::InternalServerError().json("Failed to fetch repository tree"),
+        Err(_e) => {
+            // Log the request error
+            HttpResponse::InternalServerError().json("Failed to fetch repository tree")
+        }
     }
 }
